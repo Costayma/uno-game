@@ -2,7 +2,7 @@ import asyncio
 import sys
 import time
 from typing import Dict
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, render_template
 from flask_socketio import SocketIO, emit, join_room, leave_room
 from uno import UnoGame, Player, CardType, Color, GameState
 
@@ -35,7 +35,7 @@ def broadcast_pool_status(expected_players: int):
 # ===== HTTP 接口 =====
 @app.route('/')
 def root():
-    return jsonify({"status": "ok", "message": "UNO 匹配服务器运行中！"})
+    return render_template('game_client.html')
 
 @app.route('/rooms')
 def list_rooms():
