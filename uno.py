@@ -91,6 +91,7 @@ class UnoGame:
         self.max_players = max_players
         self.state = GameState.WAITING
         self.players: List[Player] = []
+        self.winners: List[Player] = [] # 🚨 新增：记录离场的玩家
         self.deck: List[Card] = []
         self.discard_pile: List[Card] = []
         self.current_player_index = 0
@@ -99,7 +100,7 @@ class UnoGame:
         self.winner: Optional[Player] = None
         self.pending_draw = 0
         self.skip_next = False
-        self.uno_timer = {}  # 用于记录玩家是否已喊UNO
+        self.uno_timer = {}
 
     def add_player(self, player: Player) -> bool:
         if len(self.players) >= self.max_players:
@@ -125,23 +126,26 @@ class UnoGame:
         if len(self.players) < 2:
             print("[DEBUG] 玩家不足2人")
             return False
+        self.winners = [] # 🚨 重置胜者列表
         self._reset_game_state()
         print("[DEBUG] 游戏重置成功")
         return True
 
-    def _reset_game_state(self):
-        """重置游戏状态（保留玩家）"""
+    def reset_game(self, winner_player_id=None):
+        if self.state == GameState.FINISHED:
+            self._reset_game_state(winner_player_id)
+            return True
+        return False
+
+    def _reset_game_state(self, winner_player_id=None):
         self.deck = create_deck()
         random.shuffle(self.deck)
-        # 清空所有玩家手牌
         for player in self.players:
             player.hand = []
             player.uno_called = False
-        # 发牌
         for _ in range(7):
             for player in self.players:
                 player.hand.append(self._draw_card())
-        # 首张牌
         first_card = self._draw_card()
         while first_card.color == Color.WILD:
             self.deck.append(first_card)
@@ -150,18 +154,17 @@ class UnoGame:
         self.discard_pile = [first_card]
         self.current_color = first_card.color
         self.current_player_index = 0
+        if winner_player_id:
+            for i, p in enumerate(self.players):
+                if p.player_id == winner_player_id:
+                    self.current_player_index = i
+                    break
         self.state = GameState.PLAYING
         self.pending_draw = 0
         self.skip_next = False
         self.winner = None
+        self.winners = []
         self._apply_first_card_effect(first_card)
-
-    def reset_game(self):
-        """对外接口：重置游戏（用于再来一局）"""
-        if self.state == GameState.FINISHED:
-            self._reset_game_state()
-            return True
-        return False
 
     def _apply_first_card_effect(self, card: Card):
         if card.card_type == CardType.SKIP:
@@ -192,8 +195,6 @@ class UnoGame:
         if self.pending_draw > 0:
             if card.card_type not in (CardType.DRAW_TWO, CardType.WILD_DRAW_FOUR):
                 return False
-            # if card.card_type == CardType.DRAW_TWO and card.color != self.current_color:
-            #     return False
             return True
         top_card = self.discard_pile[-1]
         if card.color == self.current_color:
@@ -228,31 +229,93 @@ class UnoGame:
         else:
             self.current_color = card.color
 
+        # 🚨 核心改写：多人淘汰模式与胜利判定
         if len(player.hand) == 0:
-            self.state = GameState.FINISHED
-            self.winner = player
-            return {
-                "success": True,
-                "message": f"{player.nickname} 获胜！",
-                "game_over": True,
-                "winner": player.nickname,
-                "card": card
-            }
+            if len(self.players) == 2:
+                # 2 人模式：直接结束游戏
+                self.state = GameState.FINISHED
+                self.winner = player
+                return {
+                    "success": True,
+                    "message": f"{player.nickname} 获胜！",
+                    "game_over": True,
+                    "winner": player.nickname,
+                    "card": card,
+                    "is_exit_mode": False
+                }
+            else:
+                # 3人以上模式：记录离场，继续游戏
+                self.winners.append(player)
+                self.players.remove(player)
+                if self.current_player_index >= len(self.players):
+                    self.current_player_index = 0
+
+                if len(self.winners) >= 2:
+                    # 如果已经有 2 人获胜，游戏结束
+                    self.state = GameState.FINISHED
+                    self.winner = player
+                    return {
+                        "success": True,
+                        "message": f"淘汰赛结束！胜者：{player.nickname}",
+                        "game_over": True,
+                        "winner": player.nickname,
+                        "card": card,
+                        "is_exit_mode": True,
+                        "exited_players": [w.to_dict() for w in self.winners]
+                    }
+                else:
+                    # 仅一人离场，游戏继续
+                    self._next_turn()
+                    return {
+                        "success": True,
+                        "message": f"淘汰赛进行中，{player.nickname} 暂时离场！",
+                        "game_over": False,
+                        "winner": None,
+                        "card": card,
+                        "is_exit_mode": True,
+                        "exited_players": [w.to_dict() for w in self.winners]
+                    }
 
         self._apply_card_effect(card)
+
+        # ✅ 【情况一】最后一张牌是功能牌：绝对优先补牌，补完立刻换下家
+        if len(player.hand) == 1:
+            if player.hand[0].card_type != CardType.NUMBER:
+                new_card = self._draw_card()
+                player.hand.append(new_card)
+                player.uno_called = False
+                self._next_turn()  # 🚨 补完牌，立刻把回合交给下家
+                return {
+                    "success": True,
+                    "message": f"检测到您最后一张牌是功能牌，自动为您补摸一张牌！",
+                    "game_over": False,
+                    "winner": None,
+                    "card": card,
+                    "auto_draw": True
+                }
+
+        # ✅ 【情况二】最后一张牌是数字牌，且玩家忘了喊UNO：触发3秒等待
+        if len(player.hand) == 1 and not player.uno_called:
+            # 🚨 注意：这里不要写 _next_turn()，换人的动作交给后端 3秒后台任务处理
+            return {
+                "success": True,
+                "message": f"{player.nickname} 忘了喊 UNO！",
+                "game_over": False,
+                "winner": None,
+                "card": card,
+                "forgot_uno": True,
+                "auto_draw": False
+            }
+
+        # 其他正常情况
         self._next_turn()
-
-        # 在设置当前颜色之后，判断手牌数
-        if len(player.hand) > 1:
-            player.uno_called = False  # 只有手牌数 >1 时才重置
-        # 如果手牌数为 1，保留原来的 uno_called 状态（已喊过则为 True）
-
         return {
             "success": True,
             "message": f"{player.nickname} 打出了 {card}",
             "game_over": False,
             "winner": None,
-            "card": card
+            "card": card,
+            "auto_draw": False
         }
 
     def _apply_card_effect(self, card: Card):
@@ -286,7 +349,6 @@ class UnoGame:
         for _ in range(count):
             drawn.append(self._draw_card())
         player.hand.extend(drawn)
-        # 如果抽牌后手牌数 > 1，取消 UNO 状态
         if len(player.hand) > 1:
             player.uno_called = False
         self.pending_draw = 0
@@ -302,7 +364,6 @@ class UnoGame:
         return {"success": True, "message": f"{player.nickname} 喊了 UNO！"}
 
     def catch_uno(self, target_player: Player, caller_player: Player) -> dict:
-        """抓未喊UNO"""
         if target_player not in self.players or caller_player not in self.players:
             return {"success": False, "message": "玩家不存在"}
         if target_player == caller_player:
@@ -311,10 +372,9 @@ class UnoGame:
             return {"success": False, "message": "该玩家手牌不是1张，不能抓"}
         if target_player.uno_called:
             return {"success": False, "message": "该玩家已经喊过UNO"}
-        # 罚摸2张
         for _ in range(2):
             target_player.hand.append(self._draw_card())
-        target_player.uno_called = True  # 标记已处理
+        target_player.uno_called = True
         return {"success": True, "message": f"{caller_player.nickname} 抓了 {target_player.nickname} 未喊UNO，罚摸2张"}
 
     def get_game_state(self) -> dict:
