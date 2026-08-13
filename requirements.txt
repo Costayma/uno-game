@@ -4,8 +4,10 @@ anyio==4.14.2
 bidict==0.23.1
 click==8.4.2
 colorama==0.4.6
+dnspython==2.8.0
+eventlet==0.41.1
 fastapi==0.140.0
-greenlet==3.5.4
+greenlet==3.3.2
 gunicorn==26.0.0
 h11==0.16.0
 idna==3.18
