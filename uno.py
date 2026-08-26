@@ -3,7 +3,7 @@ UNO 游戏逻辑模块
 """
 import random
 from enum import Enum
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 class Color(Enum):
     RED = "red"
@@ -19,6 +19,8 @@ class CardType(Enum):
     DRAW_TWO = "draw_two"
     WILD = "wild"
     WILD_DRAW_FOUR = "wild_draw_four"
+    CAGE = "cage"          # 围笼（举数论点模式专属）
+    DRAW_SIX = "draw_six"  # +6牌（举数论点模式专属）
 
 class Card:
     """UNO 卡牌"""
@@ -41,6 +43,10 @@ class Card:
             return "wild"
         elif self.card_type == CardType.WILD_DRAW_FOUR:
             return "wild_draw4"
+        elif self.card_type == CardType.CAGE:
+            return "cage"
+        elif self.card_type == CardType.DRAW_SIX:
+            return "draw_six"
         else:
             return f"{self.color.value}_{self.card_type.value}"
 
@@ -60,6 +66,40 @@ def create_deck() -> List[Card]:
     for _ in range(4):
         deck.append(Card(Color.WILD, CardType.WILD))
         deck.append(Card(Color.WILD, CardType.WILD_DRAW_FOUR))
+    return deck
+
+
+def create_debate_deck() -> List[Card]:
+    """创建举数论点模式的牌组（数字牌和功能牌翻倍，万能牌各加6张，新增围笼4张、+6牌2张）"""
+    deck = []
+    colors = [Color.RED, Color.YELLOW, Color.GREEN, Color.BLUE]
+    
+    # 数字牌翻倍：每种颜色 0×2, 1-9×4
+    for color in colors:
+        for _ in range(2):
+            deck.append(Card(color, CardType.NUMBER, 0))
+        for num in range(1, 10):
+            for _ in range(4):
+                deck.append(Card(color, CardType.NUMBER, num))
+    
+    # 功能牌翻倍：每种颜色 Skip×4, Reverse×4, DrawTwo×4
+    for color in colors:
+        for _ in range(4):
+            deck.append(Card(color, CardType.SKIP))
+            deck.append(Card(color, CardType.REVERSE))
+            deck.append(Card(color, CardType.DRAW_TWO))
+    
+    # 万能牌：原版4张 + 新增6张 = 各10张
+    for _ in range(10):
+        deck.append(Card(Color.WILD, CardType.WILD))
+        deck.append(Card(Color.WILD, CardType.WILD_DRAW_FOUR))
+    
+    # 新增卡牌：围笼4张（万能牌），+6牌2张（万能牌）
+    for _ in range(4):
+        deck.append(Card(Color.WILD, CardType.CAGE))
+    for _ in range(2):
+        deck.append(Card(Color.WILD, CardType.DRAW_SIX))
+    
     return deck
 
 class Player:
@@ -84,14 +124,20 @@ class GameState(Enum):
     PLAYING = "playing"
     FINISHED = "finished"
 
+class GameMode(Enum):
+    NORMAL = "normal"      # 普通模式
+    DEBATE = "debate"      # 举数论点模式
+
+
 class UnoGame:
     """UNO 游戏房间"""
-    def __init__(self, room_id: str, max_players: int = 4):
+    def __init__(self, room_id: str, max_players: int = 4, mode: GameMode = GameMode.NORMAL):
         self.room_id = room_id
         self.max_players = max_players
+        self.mode = mode  # 游戏模式
         self.state = GameState.WAITING
         self.players: List[Player] = []
-        self.winners: List[Player] = [] # 🚨 新增：记录离场的玩家
+        self.winners: List[Player] = []
         self.deck: List[Card] = []
         self.discard_pile: List[Card] = []
         self.current_player_index = 0
@@ -101,6 +147,8 @@ class UnoGame:
         self.pending_draw = 0
         self.skip_next = False
         self.uno_timer = {}
+        # 围笼判定数据：{target_player_id: cage_required_color}
+        self.cage_pending: Dict[str, Color] = {}
 
     def add_player(self, player: Player) -> bool:
         if len(self.players) >= self.max_players:
@@ -138,11 +186,15 @@ class UnoGame:
         return False
 
     def _reset_game_state(self, winner_player_id=None):
-        self.deck = create_deck()
+        if self.mode == GameMode.DEBATE:
+            self.deck = create_debate_deck()
+        else:
+            self.deck = create_deck()
         random.shuffle(self.deck)
         for player in self.players:
             player.hand = []
             player.uno_called = False
+        self.cage_pending = {}  # 重置围笼判定
         for _ in range(7):
             for player in self.players:
                 player.hand.append(self._draw_card())
@@ -193,7 +245,7 @@ class UnoGame:
         if player not in self.players or card not in player.hand:
             return False
         if self.pending_draw > 0:
-            if card.card_type not in (CardType.DRAW_TWO, CardType.WILD_DRAW_FOUR):
+            if card.card_type not in (CardType.DRAW_TWO, CardType.WILD_DRAW_FOUR, CardType.DRAW_SIX):
                 return False
             return True
         top_card = self.discard_pile[-1]
@@ -330,6 +382,63 @@ class UnoGame:
             self.pending_draw += 2
         elif card.card_type == CardType.WILD_DRAW_FOUR:
             self.pending_draw += 4
+        elif card.card_type == CardType.DRAW_SIX:
+            self.pending_draw += 6
+        elif card.card_type == CardType.CAGE:
+            # 围笼效果：在下家判定区域登记，下家判定时检查
+            next_idx = (self.current_player_index + self.direction) % len(self.players)
+            next_player = self.players[next_idx]
+            self.cage_pending[next_player.player_id] = self.current_color
+
+    def perform_judgment_phase(self) -> dict:
+        """执行判定阶段：检查当前玩家是否有围笼判定，抽取判定牌，返回判定结果
+        返回: {
+            'need_judgment': bool,  # 是否执行了判定
+            'judge_card': Card,     # 判定牌
+            'cage_success': bool,   # 判定牌颜色是否符合（True=符合，不处罚；False=不符合，处罚）
+            'message': str,         # 判定结果描述
+            'penalty_applied': bool # 是否已执行处罚（罚4张+跳过）
+        }
+        """
+        current = self.get_current_player()
+        if not current:
+            return {'need_judgment': False}
+        if current.player_id not in self.cage_pending:
+            return {'need_judgment': False}
+        
+        required_color = self.cage_pending.pop(current.player_id)
+        # 抽取判定牌：牌堆顶的一张牌
+        judge_card = self._draw_card()
+        # 将判定牌放入弃牌堆
+        self.discard_pile.append(judge_card)
+        
+        if judge_card.color == required_color:
+            # 判定成功：判定牌颜色符合，不处罚
+            return {
+                'need_judgment': True,
+                'judge_card': judge_card.to_dict() if judge_card else None,
+                'cage_success': True,
+                'required_color': required_color.value,
+                'judge_color': judge_card.color.value,
+                'message': f'围笼判定：判定牌为 {judge_card.color.value}，符合要求！',
+                'penalty_applied': False
+            }
+        else:
+            # 判定失败：颜色不符合，罚摸4张并跳过回合
+            for _ in range(4):
+                current.hand.append(self._draw_card())
+            if len(current.hand) > 1:
+                current.uno_called = False
+            self.skip_next = True
+            return {
+                'need_judgment': True,
+                'judge_card': judge_card.to_dict() if judge_card else None,
+                'cage_success': False,
+                'required_color': required_color.value,
+                'judge_color': judge_card.color.value,
+                'message': f'围笼判定：判定牌为 {judge_card.color.value}，不是 {required_color.value}！{current.nickname} 罚摸4张并跳过回合！',
+                'penalty_applied': True
+            }
 
     def _next_turn(self):
         if self.skip_next:
@@ -382,6 +491,8 @@ class UnoGame:
         return {
             "room_id": self.room_id,
             "state": self.state.value,
+            "max_players": self.max_players,
+            "mode": self.mode.value,  # 游戏模式
             "players": [p.to_dict() for p in self.players],
             "current_player": current.to_dict() if current else None,
             "current_color": self.current_color.value if self.current_color else None,
